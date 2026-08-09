@@ -65,7 +65,8 @@ Options:
   --embodiment NAME          Embodiment config key (default: fr3duo_mobile)
   --controller-mode MODE     none|position (default: position)
   --with-keyboard-teleop     Start the keyboard->base teleop adapter (default input)
-  --with-gello-teleop        Start the GELLO->bridge teleop adapter
+  --with-gello-teleop        Start the gello_pedal_teleop device container
+                             (GELLO publisher + gello_to_bridge.py)
   --with-gello-pedal-teleop  Alias of --with-gello-teleop (tested pedal+GELLO path)
   --with-arm-keyboard-teleop Drive both arm end effectors from the Isaac Sim
                              window keyboard via dual RMPflow. LEFT arm:
@@ -214,7 +215,6 @@ esac
 # Build the set of teleop adapters to launch inside the teleop_adapters service.
 TELEOP_ADAPTERS=""
 ${WITH_KEYBOARD_TELEOP} && TELEOP_ADAPTERS="${TELEOP_ADAPTERS} keyboard"
-${WITH_GELLO_TELEOP} && TELEOP_ADAPTERS="${TELEOP_ADAPTERS} gello"
 TELEOP_ADAPTERS="$(echo "${TELEOP_ADAPTERS}" | xargs || true)"
 
 echo "Isaac Sim container: ${ISAACSIM_CONTAINER}"
@@ -229,6 +229,7 @@ fi
 echo "Embodiment:          ${EMBODIMENT}"
 echo "Controller mode:     ${CONTROLLER_MODE}"
 echo "Teleop adapters:     ${TELEOP_ADAPTERS:-<none>}"
+echo "GELLO device teleop: ${WITH_GELLO_TELEOP}"
 echo "Arm keyboard teleop: ${WITH_ARM_KEYBOARD_TELEOP}"
 
 if ! docker ps --format '{{.Names}}' | grep -qx "${ISAACSIM_CONTAINER}"; then

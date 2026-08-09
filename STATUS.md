@@ -1,6 +1,6 @@
 # Simulation Development Status
 
-Last updated: 2026-07-29 — updated with each release; every checkmark is verifiable in this repository's history.
+Last updated: 2026-08-05 — updated with each release; every checkmark is verifiable in this repository's history.
 
 ## Legend
 

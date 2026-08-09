@@ -52,7 +52,7 @@ Robot vertical spine is controlled via:
 
 Dual arms teleoperation is supported via:
 - **Keyboard**: via RMPflow (Lula) policies, with the Isaac Sim window focused.
-- **GELLO**: via the `franka_gello_state_publisher` from the [`EBiM-Benchmark/teleoperation`](https://github.com/EBiM-Benchmark/teleoperation) repository.
+- **GELLO**: via the `franka_gello_state_publisher` from the [`EBiM-Benchmark/teleoperation`](https://github.com/EBiM-Benchmark/teleoperation) repository, run *inside* the `task2_gello_pedal_teleop` container started by `--with-gello-teleop` — not on the host (see Quickstart below).
 - **Web UI**: via the `task2_browser_controller` Docker Compose service (accessed via <http://localhost:8090>) in the helper stack. This is a no-hardware alternative to the GELLO arms: it controls the joint states directly from UI sliders.
 
 ## Quickstart
@@ -151,6 +151,10 @@ The spine keyboard control is `Up/Down`, with Isaac Sim GUI focused.
 
 ### Room scene with foot pedal base + GELLO arms
 
+Point `TELEOPERATION_ROOT` at your `teleoperation` checkout and pick a
+calibration with `GELLO_CONFIG_FILE` in `task2_isaacsim/.env` (copy from
+[.env.example](.env.example) if you have not already).
+
 ```bash
 bash task2_isaacsim/scripts/run_isaacsim_teleop.sh \
    --scene room \
@@ -160,12 +164,21 @@ bash task2_isaacsim/scripts/run_isaacsim_teleop.sh \
 
 #### Base: Foot Pedal + Arms: GELLO
 
-On the host (teleoperation env): launch the GELLO publisher and the pedal
-publisher (see the `teleoperation` repo README):
+`--with-gello-teleop` starts the `task2_gello_pedal_teleop` container, which
+colcon-builds `franka_gello_state_publisher` and `pedal_state_publisher` from
+the mounted `teleoperation` checkout, then runs the GELLO publisher plus
+`gello_to_bridge.py` itself. **Do not also run `franka_gello_state_publisher`
+on the host** — the container owns the serial devices, and a second
+publisher would fight it for the port. For the same reason, `teleop_adapters`
+deliberately does *not* get the `gello` adapter in this mode (see the
+`docker-compose.yml` comment on that service) — running it there too would
+publish `/bridge/*` twice.
+
+Start the pedal publisher from a second, interactive terminal:
 
 ```bash
-ros2 launch franka_gello_state_publisher main.launch.py config_file:=franka_gello_duo.yaml
-ros2 run pedal_state_publisher pedal_state_publisher
+docker exec -it task2_gello_pedal_teleop bash -lc \
+  'source /opt/ros/jazzy/setup.bash && source /tmp/task1_teleop_install/setup.bash && ros2 run pedal_state_publisher pedal_state_publisher'
 ```
 
 #### Spine: Keyboard
@@ -281,7 +294,11 @@ reused Task 1 scripts — lives in the
   the browser controller together with the simulator (or `--no-browser`).
 - Helper defaults live in [.env.example](.env.example) (copy to `.env` to
   override): gripper open/closed calibration, adapter selection, controller
-  mode.
+  mode, and the `gello_pedal_teleop` container's `TELEOPERATION_ROOT` /
+  `GELLO_CONFIG_FILE`.
+- **GELLO container restarts:** inspect
+  `docker logs task2_gello_pedal_teleop --tail=200` and verify
+  `TELEOPERATION_ROOT` plus `/dev/serial/by-id` access.
 - The bridge defaults match Task 1: physics 240 Hz / render 60 Hz, joint
   states on `/isaac/*` at 60 Hz, pedal base driving at 0.5 m/s / 1.2 rad/s
   with a 1 s timeout, spine height on keyboard Up/Down.

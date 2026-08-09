@@ -43,6 +43,60 @@ group's cached command once its topics go quiet, so the drives hold the last app
 dead publisher cannot stomp later state such as a post-reset ready pose. `/pedal/state` has its own
 `--pedal-timeout` that forces the base twist to zero instead.
 
+## GELLO Duo specifics
+
+`franka_gello_state_publisher`'s `main.launch.py` reads a duo YAML and spawns one `gello_publisher`
+node per entry, namespaced `left`/`right`, publishing at **25 Hz**:
+
+```
+/{left,right}/gello/joint_states                                    -> sensor_msgs/JointState, names fr3_joint1..7, frame_id fr3_link0
+/{left,right}/gripper/gripper_client/target_gripper_width_percent   -> std_msgs/Float32
+```
+
+`gello_to_bridge.py` remaps these verbatim — `msg.position[:7]`, no IK, no clutch, no scaling — onto
+`/bridge/{left,right}_joint_commands` (renamed `{left,right}_fr3v2_joint1..7`) and
+`/bridge/{left,right}_robotiq_joint_commands`.
+
+**The GELLO path needs both helper containers, not one.** `position_controller` carries
+`/bridge/*_joint_commands` → `/isaac/*_joint_commands` (arms); `ros_republisher` carries the gripper
+topics and applies open/close calibration. The republisher sends arms to `/isaac/browser/*` by
+default, so it alone is not enough — an easy way to end up with a working gripper and a frozen arm.
+
+**Hardware is OpenRB-150, not U2D2.** The pre-assembled Franka GELLO Duo ships two ROBOTIS
+OpenRB-150 controllers (USB VID:PID `2f5d:2202`), which enumerate as CDC-ACM — `/dev/ttyACM*`, the
+device the input-channel table above already assumes. The DIY/U2D2 build is FTDI (`0403:6014`) and
+shows up as `/dev/ttyUSB*` instead.
+
+**`com_port` in the duo YAML is the bare by-id name** — e.g.
+`usb-ROBOTIS_OpenRB-150_<serial>-if00` — with no `/dev/serial/by-id/` prefix; `main.launch.py`
+prepends it. A full path there silently fails.
+
+**Power-on init routine, required every time:** handles on the base pins, white marker dots on
+joint 2 pointing up, cables untwisted, then press the reboot button on each OpenRB-150 (left of its
+USB port) twice. Skipping it yields wrong joint angles with no error.
+
+**Do not set `dynamixel_torque_enable` to 1** on an OpenRB-150 without an external 5 V supply on the
+board's power terminal and the jumper on VIN(DXL) — Franka's own docs warn it can damage the host
+USB port. Shipped configs keep it all-zero.
+
+**Calibration** (`get_offsets.py`, in the `teleoperation` repo under
+`src/franka_gello_state_publisher/scripts/`) derives `assembly_offsets` and `gripper_range_rad`. It
+imports `franka_gello_state_publisher.*`, so it must run inside the built colcon workspace — in
+practice inside the gello container, not on a bare host — and the running publisher must be stopped
+first, since it holds the serial ports open. Dual-arm calibration poses:
+
+```
+left:  --start-joints -1.57 -0.80  1.80 -3.00  1.40 1.50 -2.10
+right: --start-joints  1.57 -0.80 -1.80 -3.00 -1.40 1.50  2.10
+both:  --joint-signs 1 -1 1 -1 1 1 1
+```
+
+Franka states pre-assembled units work on stock defaults, so treat this as a verification step
+rather than a mandatory one.
+
+Upstream references: https://franka.de/gello and
+https://github.com/wuphilipp/gello_software/tree/main/ros2
+
 ## Code reuse — edit the source, not a copy
 
 This is the part that is easy to get wrong. Task 2 and Task 3 do not have their own copies of the
