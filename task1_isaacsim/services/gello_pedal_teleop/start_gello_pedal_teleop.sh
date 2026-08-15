@@ -8,6 +8,7 @@ INSTALL_ROOT=/tmp/task1_teleop_install
 BUILD_ROOT=/tmp/task1_teleop_build
 LOG_ROOT=/tmp/task1_teleop_log
 GELLO_CONFIG_FILE="${GELLO_CONFIG_FILE:-franka_gello_duo.yaml}"
+PEDAL_MODE="${PEDAL_MODE:-manual}"
 TASK1_ROOT="${TASK1_ROOT:-/workspace/task1_isaacsim}"
 GELLO_CONTAINER_NAME="${GELLO_CONTAINER_NAME:-task1_gello_pedal_teleop}"
 GELLO_ADAPTER="${TASK1_ROOT}/scripts/adapters/gello_to_bridge.py"
@@ -38,6 +39,24 @@ gello_bridge_pid=$!
 ros2 launch franka_gello_state_publisher main.launch.py config_file:="${GELLO_CONFIG_FILE}" &
 gello_publisher_pid=$!
 
+worker_pids=("${gello_bridge_pid}" "${gello_publisher_pid}")
+
+echo "GELLO teleoperation is running in task1_gello_pedal_teleop."
+if [[ "${PEDAL_MODE}" == "dual" ]]; then
+  dual_pedal_args=()
+  if [[ -n "${PEDAL_ONE_DEVICE:-}" ]]; then
+    dual_pedal_args+=(--pedal-one-device "${PEDAL_ONE_DEVICE}")
+  fi
+  if [[ -n "${PEDAL_TWO_DEVICE:-}" ]]; then
+    dual_pedal_args+=(--pedal-two-device "${PEDAL_TWO_DEVICE}")
+  fi
+  python3 /workspace/task1_isaacsim/scripts/adapters/dual_pedal_to_base.py "${dual_pedal_args[@]}" &
+  worker_pids+=("$!")
+  echo "Dual-pedal six-motion publisher is running."
+else
+  echo "Start the single-pedal publisher from an interactive terminal with:"
+  echo "  docker exec -it task1_gello_pedal_teleop bash -lc 'source /opt/ros/jazzy/setup.bash && source ${INSTALL_ROOT}/setup.bash && ros2 run pedal_state_publisher pedal_state_publisher'"
+fi
 echo "GELLO teleoperation is running in ${GELLO_CONTAINER_NAME}."
 echo "The pedal and keyboard publishers read a terminal directly, so start either"
 echo "one interactively (both drive the mobile base via /pedal/state):"
@@ -45,9 +64,9 @@ echo "  docker exec -it ${GELLO_CONTAINER_NAME} bash -lc 'source /opt/ros/jazzy/
 echo "  docker exec -it ${GELLO_CONTAINER_NAME} bash -lc 'source /opt/ros/jazzy/setup.bash && source ${INSTALL_ROOT}/setup.bash && ros2 run keyboard_state_publisher keyboard_state_publisher'"
 
 cleanup() {
-  kill "${gello_bridge_pid}" "${gello_publisher_pid}" 2>/dev/null || true
-  wait "${gello_bridge_pid}" "${gello_publisher_pid}" 2>/dev/null || true
+  kill "${worker_pids[@]}" 2>/dev/null || true
+  wait "${worker_pids[@]}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
-wait -n "${gello_bridge_pid}" "${gello_publisher_pid}"
+wait -n "${worker_pids[@]}"
