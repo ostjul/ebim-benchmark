@@ -31,11 +31,13 @@ Commands:
   down             Stop and remove all helper containers (all profiles)
   status           Show helper container status
   logs [SERVICE]   Follow logs (all services, or one of: ros_republisher,
-                   position_controller, teleop_adapters, browser_controller)
+                   position_controller, teleop_adapters, gello_pedal_teleop,
+                   browser_controller)
 
 Options for `up` (same conventions as run_isaacsim_teleop.sh):
   --with-keyboard-teleop     Start the keyboard->base teleop adapter
-  --with-gello-teleop        Start the GELLO->bridge teleop adapter
+  --with-gello-teleop        Start the gello_pedal_teleop device container
+                             (GELLO publisher + gello_to_bridge.py)
   --with-gello-pedal-teleop  Alias of --with-gello-teleop
   --controller-mode MODE     none|position (default: position)
   --no-browser               Do not start browser_controller
@@ -97,7 +99,10 @@ cmd_up() {
 
   local teleop_adapters=""
   ${with_keyboard} && teleop_adapters="${teleop_adapters} keyboard"
-  ${with_gello} && teleop_adapters="${teleop_adapters} gello"
+  # Deliberately NOT adding "gello" here: the gello_pedal_teleop device
+  # container already runs gello_to_bridge.py, so also selecting it in
+  # teleop_adapters would run two adapters publishing the same /bridge/*
+  # topics.
   teleop_adapters="$(echo "${teleop_adapters}" | xargs || true)"
 
   # Remove helpers disabled by the current options so containers from a
@@ -107,6 +112,7 @@ cmd_up() {
   ${with_republisher} || disabled_services+=(ros_republisher)
   [[ "${controller_mode}" == "position" ]] || disabled_services+=(position_controller)
   [[ -n "${teleop_adapters}" ]] || disabled_services+=(teleop_adapters)
+  ${with_gello} || disabled_services+=(gello_pedal_teleop)
   ${with_browser} || disabled_services+=(browser_controller)
   if [[ ${#disabled_services[@]} -gt 0 ]]; then
     (cd "${TASK2_ROOT}" && docker compose --profile "*" rm -sf "${disabled_services[@]}")
@@ -129,6 +135,13 @@ cmd_up() {
   if [[ -n "${teleop_adapters}" ]]; then
     echo "Starting teleop_adapters (${teleop_adapters})..."
     (cd "${TASK2_ROOT}" && env "TELEOP_ADAPTERS=${teleop_adapters}" docker compose --profile teleop up -d --no-deps teleop_adapters)
+  fi
+
+  if ${with_gello}; then
+    echo "Starting gello_pedal_teleop (first run builds the image)..."
+    (cd "${TASK2_ROOT}" && docker compose --profile teleop up -d --no-deps gello_pedal_teleop)
+    echo "Pedal publisher (run in a second terminal):"
+    echo "  docker exec -it task2_gello_pedal_teleop bash -lc 'source /opt/ros/jazzy/setup.bash && source /tmp/task1_teleop_install/setup.bash && ros2 run pedal_state_publisher pedal_state_publisher'"
   fi
 
   if ${with_browser}; then

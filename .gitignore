@@ -24,6 +24,8 @@ DEMO/
 **/runs/*
 **/logs/*
 **/recordings/*
+# Recorded LeRobot datasets (task2_isaacsim/scripts/run_recorder.sh output).
+task2_isaacsim/dataset/
 **/output/*
 **/outputs/*
 **/videos/*

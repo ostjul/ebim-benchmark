@@ -9,9 +9,10 @@ see the [README](README.md).
 | Process | Where it runs | Repo mount | Role |
 |---|---|---|---|
 | Scene script + bridge (`scripts/scene_room.py` / `scene_barebone.py` + `isaacsim_fr3duo_teleop_bridge_core.py`) | `isaac-sim-5-1-0-workshop` container, via `/isaac-sim/python.sh` (launched by `scripts/run_isaacsim_teleop.sh`) | `/workspace/EBiM_Challenge` | Simulation, teleop runtime, joint state/command ROS node; with `--record` also `/isaac/clock` (bridge node), the camera OmniGraphs (`scripts/recording/camera_publishers.py`), and ground-truth publishers (`scripts/recording/scene_capture.py`) |
-| Helper stack (`ros_republisher`, `position_controller`, `teleop_adapters`, `browser_controller`) | `task2_*` containers from [docker-compose.yml](docker-compose.yml), all `ros:jazzy-ros-base`-based | `../task1_isaacsim` at `/workspace` | Task 1 scripts reused verbatim: remap `/bridge/*` commands onto `/isaac/*`, adapt device topics, serve the browser UI (port 8090) |
+| Helper stack (`ros_republisher`, `position_controller`, `teleop_adapters`, `gello_pedal_teleop`, `browser_controller`) | `task2_*` containers from [docker-compose.yml](docker-compose.yml), all `ros:jazzy-ros-base`-based | `../task1_isaacsim` at `/workspace` (`gello_pedal_teleop` instead mounts it at `/workspace/task1_isaacsim`, alongside `teleoperation` at `/workspace/teleoperation` — see Mapping to Task 1 counterparts) | Task 1 scripts reused verbatim: remap `/bridge/*` commands onto `/isaac/*`, adapt device topics, run the GELLO + pedal device publishers, serve the browser UI (port 8090) |
 | Recorder (`services/recording/record_task2.py`) | `task2_lerobot_recorder` container (compose profile `record`), launched by `scripts/run_recorder.sh` | whole repo at `/repo`, working dir `/repo/task2_isaacsim` | Subscribes to the recording topics and writes the LeRobot dataset + `task2_extras/` sidecar |
-| Device publishers (keyboard / GELLO / pedal) | host, from the [`teleoperation`](https://github.com/EBiM-Benchmark/teleoperation) repo | — | Publish `/keyboard/state`, `/{left,right}/gello/joint_states`, pedal state |
+| Device publisher: keyboard | host, from the [`teleoperation`](https://github.com/EBiM-Benchmark/teleoperation) repo | — | Publishes `/keyboard/state` |
+| Device publishers: GELLO + pedal | inside `task2_gello_pedal_teleop` (part of the helper stack above), running the same `teleoperation` checkout mounted as a container-side sibling | — | Publish `/{left,right}/gello/joint_states`, pedal state |
 
 Everything is `network_mode: host` + FastDDS over UDPv4, so topics flow
 between the containers and the host without any broker configuration.
@@ -32,7 +33,8 @@ Isaac Sim; the recorder imports it through
 
 | Topic | Type | Producer → Consumer |
 |---|---|---|
-| `/keyboard/state`, `/{left,right}/gello/joint_states`, gripper width topics | various | host device publishers → teleop adapters |
+| `/keyboard/state` | various | host device publisher → teleop adapters (`keyboard_to_base.py`) |
+| `/{left,right}/gello/joint_states`, gripper width topics | various | GELLO publisher → `gello_to_bridge.py`, both inside `gello_pedal_teleop` |
 | `/pedal/state` | `std_msgs/String` | teleop adapters (`keyboard_to_base.py`) or host pedal publisher → bridge (swerve base) |
 | `/bridge/{left,right}_joint_commands`, `/bridge/{left,right}_robotiq_joint_commands` | `sensor_msgs/JointState` | adapters / browser UI → republisher + position controller *(task1-side names, not in the contract)* |
 | `/isaac/{left,right}_joint_commands` | `sensor_msgs/JointState` | position controller → bridge |
@@ -108,7 +110,7 @@ labels topic above — never resolve one stream's IDs through another's map.
 |---|---|---|
 | `scripts/scene_barebone.py`, `scripts/scene_room.py`, `scripts/isaacsim_fr3duo_teleop_bridge_core.py` | `scripts/isaaclab_fr3duo_newton_bridge.py` | Reimplementation for plain Isaac Sim 5.1.0 / PhysX (Isaac Lab + Newton cannot run the deformable pad). Same topics, joint names, defaults; ports task1's swerve-base math, spine keyboard control, and articulation-root fix. Imports task1's `isaac_bridge_constants.py` directly. |
 | `scripts/run_isaacsim_teleop.sh` | `scripts/run_isaaclab_newton_teleop.sh` | Same flag conventions; simpler (expects the Isaac Sim container to be already running; adds `--scene room\|barebone`). |
-| `docker-compose.yml` (containers `task2_*`) | Same-named services in `task1_isaacsim/docker-compose.yml` (containers `task1_*`) | Same images, commands, env, profiles — only the volume differs: task2 mounts `../task1_isaacsim` at `/workspace`, so the containers execute the Task 1 scripts unmodified. |
+| `docker-compose.yml` (containers `task2_*`) | Same-named services in `task1_isaacsim/docker-compose.yml` (containers `task1_*`) | Same images, commands, env, profiles — the volume differs: task2 mounts `../task1_isaacsim` at `/workspace`, so the containers execute the Task 1 scripts unmodified. One exception: `gello_pedal_teleop` mounts `../task1_isaacsim` at `/workspace/task1_isaacsim` (not `/workspace`) plus a separate `teleoperation` mount at `/workspace/teleoperation`, since the shared start script (`TASK1_ROOT`/`GELLO_ADAPTER` env indirection) needs both as siblings. |
 | *(no copy — reused via mount)* | `scripts/adapters/keyboard_to_base.py`, `scripts/adapters/gello_to_bridge.py` | Pure topic remappers, task-agnostic. |
 | *(no copy — reused via mount)* | `scripts/controllers/ros_joint_republisher.py`, `scripts/controllers/joint_position_controller.py` | Isaac-agnostic rclpy nodes. |
 | *(no copy — reused via mount)* | `services/teleop_adapters/`, `services/browser_controller/` | Adapter launcher + web UI (port 8090). |

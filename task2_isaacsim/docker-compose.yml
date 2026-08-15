@@ -6,9 +6,11 @@
 # These are the *same* helper nodes as Task 1 — the adapter/controller scripts
 # and browser UI are reused verbatim by mounting ../task1_isaacsim at /workspace.
 # The simulator itself is launched by scripts/run_isaacsim_teleop.sh inside the
-# Isaac Sim 5.1.0 container (isaac-sim-5-1-0-workshop). The teleop input
-# *device* publishers (keyboard / GELLO / pedal) come from the EBiM
-# `teleoperation` repository on the host.
+# Isaac Sim 5.1.0 container (isaac-sim-5-1-0-workshop). Of the teleop input
+# *device* publishers, only keyboard comes from the EBiM `teleoperation`
+# repository on the host — GELLO and the pedal publisher instead run inside
+# the gello_pedal_teleop service below, which mounts that same checkout
+# itself (see task1_isaacsim/services/gello_pedal_teleop).
 #
 # NOTE: these services bind the same host-network topics (and browser port
 # 8090) as the Task 1 helper stack — run either the task1 or the task2 helper
@@ -62,6 +64,9 @@ services:
   #   keyboard_to_base.py : /keyboard/state -> /pedal/state
   #   gello_to_bridge.py  : /*/gello/joint_states -> /bridge/*
   # Select adapters with TELEOP_ADAPTERS (e.g. "keyboard", "gello", or both).
+  # NOTE: do not also select "gello" here — the gello_pedal_teleop service
+  # below already runs gello_to_bridge.py, and running both would publish
+  # /bridge/* twice.
   teleop_adapters:
     image: ros:jazzy-ros-base
     container_name: task2_teleop_adapters
@@ -73,9 +78,48 @@ services:
       - ROS_DISTRO=jazzy
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
       - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
-      - TELEOP_ADAPTERS=${TELEOP_ADAPTERS:-keyboard gello}
+      - TELEOP_ADAPTERS=${TELEOP_ADAPTERS:-keyboard}
     volumes:
       - ../task1_isaacsim:/workspace
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    profiles:
+      - teleop
+
+  # GELLO hardware publisher and GELLO->bridge adapter, plus the pedal
+  # publisher (started interactively — it reads directly from a terminal).
+  # Runs the shared task1_isaacsim start script; see
+  # task1_isaacsim/services/gello_pedal_teleop for the script itself.
+  #
+  # MOUNT EXCEPTION: unlike every other service in this file, this one does
+  # NOT bind ../task1_isaacsim at /workspace. The shared start script
+  # resolves the adapter under /workspace/task1_isaacsim and needs the
+  # teleoperation checkout mounted as a SIBLING at /workspace/teleoperation.
+  # Nesting the teleoperation bind inside a /workspace mount of
+  # ../task1_isaacsim would make Docker materialise an empty
+  # task1_isaacsim/teleoperation/ directory in the working tree.
+  gello_pedal_teleop:
+    build:
+      context: ../task1_isaacsim/services/gello_pedal_teleop
+      dockerfile: Dockerfile
+    container_name: task2_gello_pedal_teleop
+    network_mode: host
+    ipc: host
+    working_dir: /workspace/teleoperation
+    command: bash /workspace/task1_isaacsim/services/gello_pedal_teleop/start_gello_pedal_teleop.sh
+    environment:
+      - ROS_DISTRO=jazzy
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - GELLO_CONFIG_FILE=${GELLO_CONFIG_FILE:-franka_gello_duo.yaml}
+      - GELLO_CONTAINER_NAME=task2_gello_pedal_teleop
+    volumes:
+      - ../task1_isaacsim:/workspace/task1_isaacsim
+      - ${TELEOPERATION_ROOT:-../../teleoperation}:/workspace/teleoperation
+      - /dev:/dev
+    privileged: true
     restart: unless-stopped
     tty: true
     stdin_open: true
