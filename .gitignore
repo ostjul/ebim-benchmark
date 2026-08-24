@@ -24,6 +24,7 @@ DEMO/
 **/runs/*
 **/logs/*
 **/recordings/*
+task2_isaacsim/captures/
 **/output/*
 **/outputs/*
 **/videos/*

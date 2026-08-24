@@ -196,6 +196,34 @@ ros2 run pedal_state_publisher pedal_state_publisher
 
 The spine keyboard control is `Up/Down`, with Isaac Sim GUI focused.
 
+## Room-only orbit capture
+
+Dump 120 eye-height frames on an ellipse around the Task 2 table XY
+`(2.05, 1.95)` (5 m diameter in X, 1 m diameter in Y), looking **along
+the path** (true slope), with a ±10 cm height wave, then four 1 m
+circles at the same center: **inward** at 1.00 m and 1.50 m, **outward**
+at 1.25 m and 1.75 m (120 poses each). **Only**
+`assets/robot_room.usd` is loaded (no robot or Task 2 objects). Pinhole RGB
+matches eval camera intrinsics (1280×720). After the orbits, one 360
+equirectangular still is captured at the same table XY / 1.5 m height.
+This is a **separate Kit run** from teleop — stop `scene_room.py` first.
+
+Orbit and camera specs live in
+[config/room_flythrough.yaml](config/room_flythrough.yaml). Output defaults
+to `task2_isaacsim/captures/room_flythrough_<timestamp>/`
+(`rgb/000000.png` …, `orbit.mp4`, `orbit_trajectory.png`,
+`panorama/equirect.png`, `poses.json`, `camera.json`,
+`panorama_pose.json`).
+
+```bash
+# stop the teleop scene first if it is running
+bash task2_isaacsim/scripts/run_room_capture.sh --headless
+
+# optional: pick the output folder (path is inside the Isaac Sim container)
+bash task2_isaacsim/scripts/run_room_capture.sh --headless -- \
+  --out /workspace/EBiM_Challenge/task2_isaacsim/captures/run1
+```
+
 ## Demonstration recording (LeRobot dataset)
 
 Record teleoperation demonstrations as a **LeRobot dataset** (20-dim
