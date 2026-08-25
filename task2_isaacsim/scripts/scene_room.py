@@ -10,7 +10,8 @@ build_stage(), and drives it with the same ROS teleop bridge as the barebone
 scene_barebone.py (shared isaacsim_fr3duo_teleop_bridge_core module).
 
 --room-usd defaults to robot_room.usd. A NuRec .usdz instead composes that
-volume with --mesh under one joint xform (--xyz-deg / --xyz / --scale).
+volume with --mesh. --xyz-deg / --xyz / --scale always move the loaded room
+(robot stays in world).
 
 Runs inside the plain Isaac Sim 5.1.0 container with /isaac-sim/python.sh; see
 scene_barebone.py for the environment requirements and
@@ -49,12 +50,10 @@ TASK2_VIEW_EYE = (1.0, 2.5, 1.35)
 ENV_ROOT_PATH = "/World/Environment/Room"
 ENV_VOLUME_PATH = f"{ENV_ROOT_PATH}/Volume"
 ENV_MESH_PATH = f"{ENV_ROOT_PATH}/Mesh"
+ROOM_USD_PRIM_PATH = "/World/Environment/RobotRoom"
 TABLE_PATH = "/World/Scene/Table"
 # GLB node is already Rx(+90°); cancel it so mesh and volume share --xyz-deg.
 MESH_RX_OFFSET_DEG = -90.0
-# Crop in the volume's local (pre-Rx) frame; drops far Gaussian floaters.
-NUREC_CROP_MIN = (-1.73, -1.24, -1.82)
-NUREC_CROP_MAX = (1.51, 1.09, 4.02)
 
 
 def _is_nurec_asset(path: Path) -> bool:
@@ -64,7 +63,7 @@ def _is_nurec_asset(path: Path) -> bool:
 def _as_scale(values: Any) -> tuple[float, float, float]:
     if not values:
         return (1.0, 1.0, 1.0)
-    vals = [float(v) for v in values]
+    vals = [abs(float(v)) for v in values]
     if len(vals) == 1:
         return (vals[0], vals[0], vals[0])
     if len(vals) == 3:
@@ -100,8 +99,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         nargs=3,
         default=(0.0, 0.0, 0.0),
         metavar=("RX", "RY", "RZ"),
-        help="Euler XYZ rotation (degrees) of the NuRec volume and mesh "
-        "together. Ignored for a regular room USD.",
+        help="Euler XYZ rotation (degrees) of the loaded room "
+        "(NuRec volume+mesh, or robot_room.usd). Robot stays in world.",
     )
     parser.add_argument(
         "--xyz",
@@ -109,8 +108,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         nargs=3,
         default=(0.0, 0.0, 0.0),
         metavar=("X", "Y", "Z"),
-        help="Translate (metres) of the NuRec volume and mesh together. "
-        "Ignored for a regular room USD.",
+        help="Translate (metres) of the loaded room "
+        "(NuRec volume+mesh, or robot_room.usd). Robot stays in world.",
     )
     parser.add_argument(
         "--scale",
@@ -118,15 +117,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=[1.0],
         metavar="S",
-        help="Scale of the NuRec volume and mesh together: one uniform "
-        "value or X Y Z. Ignored for a regular room USD.",
+        help="Scale of the loaded room (NuRec volume+mesh, or "
+        "robot_room.usd): one uniform value or X Y Z, each "
+        "clamped to [0, +inf). Robot stays in world.",
     )
     parser.add_argument(
         "--align",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Listen for align_nudger.py (NuRec mode only). "
-        "Disable with --no-align.",
+        "Off unless you pass --align.",
     )
     parser.add_argument(
         "--task",
@@ -240,23 +240,6 @@ from isaacsim.core.prims import SingleArticulation  # noqa: E402
 from isaacsim.core.utils.viewports import set_camera_view  # noqa: E402
 
 
-def _crop_nurec_volumes(stage: Any, root_path: str) -> int:
-    from pxr import Gf, Usd
-
-    root = stage.GetPrimAtPath(root_path)
-    if not root or not root.IsValid():
-        return 0
-    cropped = 0
-    for prim in Usd.PrimRange(root):
-        flag = prim.GetAttribute("omni:nurec:isNuRecVolume")
-        if not (flag and flag.IsValid() and flag.Get()):
-            continue
-        prim.GetAttribute("omni:nurec:crop:minBounds").Set(Gf.Vec3f(*NUREC_CROP_MIN))
-        prim.GetAttribute("omni:nurec:crop:maxBounds").Set(Gf.Vec3f(*NUREC_CROP_MAX))
-        cropped += 1
-    return cropped
-
-
 def _author_mesh_collision(stage: Any, root_path: str) -> int:
     from pxr import Usd, UsdGeom, UsdPhysics
 
@@ -275,6 +258,22 @@ def _author_mesh_collision(stage: Any, root_path: str) -> int:
     return authored
 
 
+def _apply_env_xform(
+    prim: Any,
+    xyz: tuple[float, float, float],
+    xyz_deg: tuple[float, float, float],
+    scale: tuple[float, float, float],
+) -> None:
+    """Translate, Euler-XYZ rotate, then scale a room root. Robot is unchanged."""
+    from pxr import Gf, UsdGeom
+
+    room_scene.set_xform(prim, xyz, room_scene.euler_xyz_to_quat(xyz_deg))
+    UsdGeom.Xformable(prim).AddScaleOp(UsdGeom.XformOp.PrecisionDouble).Set(
+        Gf.Vec3d(*scale)
+    )
+    print("Joint xyz:", xyz, "Rxyz deg:", xyz_deg, "scale:", scale)
+
+
 def compose_nurec_environment(
     stage: Any,
     *,
@@ -285,19 +284,14 @@ def compose_nurec_environment(
     scale: tuple[float, float, float],
 ) -> None:
     """Volume + mesh under one joint xform; mesh only adds the GLB Rx offset."""
-    from pxr import Gf, UsdGeom
+    from pxr import UsdGeom
 
     UsdGeom.Scope.Define(stage, "/World/Environment")
     root = UsdGeom.Xform.Define(stage, ENV_ROOT_PATH).GetPrim()
-    room_scene.set_xform(root, xyz, room_scene.euler_xyz_to_quat(xyz_deg))
-    UsdGeom.Xformable(root).AddScaleOp(UsdGeom.XformOp.PrecisionDouble).Set(
-        Gf.Vec3d(*scale)
-    )
+    _apply_env_xform(root, xyz, xyz_deg, scale)
 
     volume = UsdGeom.Xform.Define(stage, ENV_VOLUME_PATH).GetPrim()
     volume.GetReferences().AddReference(str(volume_path.resolve()))
-    n_crop = _crop_nurec_volumes(stage, ENV_VOLUME_PATH)
-    print(f"NuRec crop applied on {n_crop} volume prim(s)")
 
     mesh = UsdGeom.Xform.Define(stage, ENV_MESH_PATH).GetPrim()
     room_scene.set_xform(
@@ -310,7 +304,6 @@ def compose_nurec_environment(
     n_col = _author_mesh_collision(stage, ENV_MESH_PATH)
     UsdGeom.Imageable(mesh).MakeInvisible()
     print(f"Mesh collision on {n_col} Mesh prim(s) (hidden; volume stays visible)")
-    print("Joint xyz:", xyz, "Rxyz deg:", xyz_deg, "scale:", scale)
     print("Volume:", volume_path)
     print("Mesh:", mesh_path)
 
@@ -430,6 +423,12 @@ def main():
             robot_yaw=robot_yaw,
             head_placement=args_cli.head_placement,
         )
+        room_prim = omni.usd.get_context().get_stage().GetPrimAtPath(
+            ROOM_USD_PRIM_PATH
+        )
+        if not room_prim or not room_prim.IsValid():
+            raise RuntimeError(f"Missing room prim {ROOM_USD_PRIM_PATH}")
+        _apply_env_xform(room_prim, env_xyz, env_xyz_deg, env_scale)
     if args_cli.task == "task2":
         # Override build_stage's room overview with a view of the task2 table.
         # Also required for --livestream (headless Kit, WebRTC streams this

@@ -3,9 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Multi-scale similarity ICP (7-DoF: scale, rotation, translation).
 
-Aligns a reconstructed GLB collider onto ``assets/robot_room.usd``, then
-prints a pasteable ``run_isaacsim_teleop.sh`` command that loads the NuRec
-``.usdz`` volume with that GLB under the estimated joint xform.
+Aligns a reconstructed GLB collider onto ``assets/robot_room.usd``, writes
+before/after point-cloud views, then prints a pasteable
+``run_isaacsim_teleop.sh`` command that loads the NuRec ``.usdz`` volume
+with that GLB under the estimated joint xform.
 
 Requires Open3D. USD/USDZ also need pxr (Isaac Sim ``python.sh`` or
 ``usd-core``).
@@ -23,6 +24,9 @@ import argparse
 import copy
 import math
 import os
+import shlex
+import struct
+import zlib
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -50,11 +54,24 @@ Y_UP_TO_Z_UP = np.array(
     ],
     dtype=np.float64,
 )
+# Same rotation for Open3D / Isaac column-vector xforms (p' = M @ p).
+Y_UP_TO_Z_UP_COLUMN = Y_UP_TO_Z_UP.T
 DEFAULT_VOXEL_SIZES = (0.1, 0.05, 0.02)
 DEFAULT_MAX_CORR = (0.3, 0.15, 0.06)
 DEFAULT_N_POINTS = 100_000
+DEFAULT_VIS_POINTS = 40_000
+DEFAULT_VIS_SIZE = (640, 480)
 _SCALE_EPS = 1e-12
 _MIN_DOWNSAMPLED = 8
+_SOURCE_RGB = (0.95, 0.45, 0.12)
+_TARGET_RGB = (0.22, 0.58, 0.88)
+_BG_RGB = (18, 20, 24)
+_VIEWPOINTS = (
+    ("iso", np.array([1.0, -1.0, 0.55])),
+    ("front", np.array([0.0, -1.15, 0.25])),
+    ("side", np.array([1.15, 0.0, 0.25])),
+    ("top", np.array([0.0, 0.0, 1.25])),
+)
 
 
 class SimilarityICPResult(TypedDict):
@@ -100,28 +117,35 @@ def _as_4x4(matrix: npt.ArrayLike) -> npt.NDArray[np.float64]:
 def decompose_similarity(
     transformation: npt.ArrayLike,
 ) -> tuple[float, npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """Split a 4x4 similarity matrix into ``(s, R, t)``.
+    """Split a 4x4 similarity matrix into ``(s, R, t)`` with ``s >= 0``.
 
     Open3D's scaled point-to-point ICP (Umeyama) stores the similarity as
-    ``T = [[s R, t], [0, 1]]``. The uniform scale is the cube root of the
-    determinant of the top-left 3x3 block.
+    ``T = [[s R, t], [0, 1]]``. Polar decomposition via SVD yields a
+    proper rotation (``det R = +1``) and a non-negative uniform scale
+    (mean of the singular values), which Isaac Sim can apply as a
+    quaternion + ``--scale``.
 
     Args:
         transformation: Homogeneous 4x4 similarity (source → target).
 
     Returns:
-        ``s`` (scalar), orthonormal ``R`` (3x3), and ``t`` (3,).
+        ``s`` (scalar ``>= 0``), orthonormal ``R`` in SO(3), and ``t`` (3,).
     """
     matrix = _as_4x4(transformation)
     top_left = matrix[:3, :3]
-    det = float(np.linalg.det(top_left))
-    scale = float(np.cbrt(det))
-    if abs(scale) < _SCALE_EPS:
+    u_mat, singular, vt_mat = np.linalg.svd(top_left)
+    rotation = u_mat @ vt_mat
+    if float(np.linalg.det(rotation)) < 0.0:
+        u_mat = u_mat.copy()
+        u_mat[:, -1] *= -1.0
+        rotation = u_mat @ vt_mat
+    scale = float(np.mean(singular))
+    if scale < _SCALE_EPS:
+        det = float(np.linalg.det(top_left))
         raise ValueError(
             f"degenerate similarity scale {scale:.3e} "
             f"(det of 3x3 block is {det:.3e})"
         )
-    rotation = top_left / scale
     translation = matrix[:3, 3].copy()
     return scale, rotation, translation
 
@@ -137,9 +161,67 @@ def compose_similarity(
     if rot.shape != (3, 3):
         raise ValueError(f"rotation must be 3x3, got {rot.shape}")
     matrix = np.eye(4, dtype=np.float64)
-    matrix[:3, :3] = float(scale) * rot
+    matrix[:3, :3] = abs(float(scale)) * rot
     matrix[:3, 3] = trans
     return matrix
+
+
+def native_to_aligned_frame(path: Path | str) -> npt.NDArray[np.float64]:
+    """Column-vector 4x4 baked into alignment vertices (native → Z-up).
+
+    glTF/GLB is Y-up; ``glb_to_triangle_mesh`` applies Rx(+90°) so the
+    source matches a Z-up CAD target. Isaac Sim loads the same GLB/USDZ
+    in its native frame, so the teleop command must include this xform.
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix in GLB_SUFFIXES:
+        return Y_UP_TO_Z_UP_COLUMN.copy()
+    return np.eye(4, dtype=np.float64)
+
+
+def scene_similarity_from_alignment(
+    align_matrix: npt.ArrayLike,
+    source_path: Path | str,
+) -> tuple[
+    float, npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]
+]:
+    """Native-source → CAD similarity for ``scene_room.py`` flags.
+
+    ``align_matrix`` maps the *aligned* (Z-up) source onto the target.
+    The loader xform is composed on the right so the result applies to
+    the original native cloud. Scale is ``>= 0``.
+
+    Returns:
+        ``(scale, rotation, translation, command_matrix)``.
+    """
+    matrix = _as_4x4(align_matrix) @ native_to_aligned_frame(source_path)
+    scale, rotation, translation = decompose_similarity(matrix)
+    command = compose_similarity(scale, rotation, translation)
+    return scale, rotation, translation, command
+
+
+def xyz_deg_to_rotation(
+    xyz_deg: npt.ArrayLike,
+) -> npt.NDArray[np.float64]:
+    """3x3 rotation from USD rotateXYZ Euler degrees (R = Rz · Ry · Rx)."""
+    angles = np.asarray(xyz_deg, dtype=np.float64).reshape(3)
+    rx, ry, rz = (math.radians(float(angle)) for angle in angles)
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+    rot_x = np.array(
+        [[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]],
+        dtype=np.float64,
+    )
+    rot_y = np.array(
+        [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]],
+        dtype=np.float64,
+    )
+    rot_z = np.array(
+        [[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    return rot_z @ rot_y @ rot_x
 
 
 def rotation_to_xyz_deg(
@@ -178,8 +260,35 @@ def format_scene_room_flags(
     return (
         f"--xyz-deg {rx:g} {ry:g} {rz:g} "
         f"--xyz {tx:g} {ty:g} {tz:g} "
-        f"--scale {float(scale):g}"
+        f"--scale {abs(float(scale)):g}"
     )
+
+
+def parse_scene_room_flags(
+    flags: str | Sequence[str],
+) -> tuple[float, npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Read ``--xyz-deg`` / ``--xyz`` / ``--scale`` from a flag string.
+
+    Extra tokens (teleop launcher args, ``--``, ``--room-usd``, ``--mesh``,
+    ...) are ignored. ``--scale`` may be one uniform value or three values
+    (mean of the absolute components).
+    """
+    argv = shlex.split(flags) if isinstance(flags, str) else list(flags)
+    argv = [token for token in argv if token != "--"]
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--xyz-deg", type=float, nargs=3, default=None)
+    parser.add_argument("--xyz", type=float, nargs=3, default=None)
+    parser.add_argument("--scale", type=float, nargs="+", default=None)
+    args, _unknown = parser.parse_known_args(argv)
+    if args.xyz_deg is None or args.xyz is None or args.scale is None:
+        raise ValueError("need --xyz-deg, --xyz, and --scale")
+    scales = [abs(float(value)) for value in args.scale]
+    if len(scales) not in (1, 3):
+        raise ValueError("--scale expects 1 or 3 floats")
+    scale = float(sum(scales) / len(scales))
+    rotation = xyz_deg_to_rotation(args.xyz_deg)
+    translation = np.asarray(args.xyz, dtype=np.float64)
+    return scale, rotation, translation
 
 
 def container_path(
@@ -212,12 +321,257 @@ def format_teleop_command(
     return (
         f"PUBLIC_IP={public_ip} CONTAINER_REPO={container_repo} \\\n"
         f"  bash task2_isaacsim/scripts/run_isaacsim_teleop.sh"
-        f"   --scene room --no-browser --"
+        f"   --scene room --no-browser --livestream --"
         f"  --room-usd {room}"
         f"    --mesh {mesh_c}  {xform}"
         f"  --record --spine-keyboard-min 0.50"
         f" --spine-keyboard-max 0.50 --render-hz 30"
     )
+
+
+def _as_xyz(cloud: Any) -> npt.NDArray[np.float64]:
+    if isinstance(cloud, np.ndarray):
+        points = np.asarray(cloud, dtype=np.float64)
+    else:
+        points = np.asarray(cloud.points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"expected Nx3 points, got shape {points.shape}")
+    return points
+
+
+def _subsample_xyz(
+    points: npt.NDArray[np.float64],
+    max_points: int,
+    rng: np.random.Generator,
+) -> npt.NDArray[np.float64]:
+    if max_points < 1 or len(points) <= max_points:
+        return points
+    index = rng.choice(len(points), int(max_points), replace=False)
+    return points[index]
+
+
+def _write_png(path: Path, rgb: npt.NDArray[np.uint8]) -> Path:
+    """Write an 8-bit RGB PNG with stdlib zlib (no PIL / matplotlib)."""
+    if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
+        raise ValueError(f"expected HxWx3 uint8, got {rgb.shape} {rgb.dtype}")
+    height, width, _ = rgb.shape
+    raw = b"".join(b"\x00" + rgb[row].tobytes() for row in range(height))
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+        return (
+            struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(raw, 6))
+        + chunk(b"IEND", b"")
+    )
+    return path
+
+
+def _look_at_basis(
+    eye: npt.NDArray[np.float64],
+    target: npt.NDArray[np.float64],
+    up: npt.NDArray[np.float64],
+) -> tuple[
+    npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]
+]:
+    forward = target - eye
+    norm = float(np.linalg.norm(forward))
+    if norm < 1e-9:
+        raise ValueError("camera eye and target are coincident")
+    forward = forward / norm
+    right = np.cross(forward, up)
+    right_norm = float(np.linalg.norm(right))
+    if right_norm < 1e-9:
+        right = np.cross(forward, np.array([1.0, 0.0, 0.0], dtype=np.float64))
+        right_norm = float(np.linalg.norm(right))
+        if right_norm < 1e-9:
+            right = np.cross(
+                forward, np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            )
+            right_norm = float(np.linalg.norm(right))
+    right = right / right_norm
+    cam_up = np.cross(right, forward)
+    cam_up = cam_up / float(np.linalg.norm(cam_up))
+    return right, cam_up, forward
+
+
+def rasterize_point_clouds(
+    clouds: Sequence[
+        tuple[npt.NDArray[np.float64], tuple[float, float, float]]
+    ],
+    *,
+    eye: npt.ArrayLike,
+    look_at: npt.ArrayLike,
+    up: npt.ArrayLike = (0.0, 0.0, 1.0),
+    width: int = 640,
+    height: int = 480,
+    fov_deg: float = 50.0,
+    point_px: int = 2,
+    background: tuple[int, int, int] = _BG_RGB,
+) -> npt.NDArray[np.uint8]:
+    """Perspective z-buffer splat of colored clouds. Far points draw first."""
+    eye_v = np.asarray(eye, dtype=np.float64).reshape(3)
+    look = np.asarray(look_at, dtype=np.float64).reshape(3)
+    up_v = np.asarray(up, dtype=np.float64).reshape(3)
+    right, cam_up, forward = _look_at_basis(eye_v, look, up_v)
+    near = 1e-3
+    chunks: list[npt.NDArray[np.float64]] = []
+    colors: list[npt.NDArray[np.float64]] = []
+    for points, rgb in clouds:
+        if len(points) == 0:
+            continue
+        chunks.append(np.asarray(points, dtype=np.float64))
+        colors.append(
+            np.broadcast_to(
+                np.asarray(rgb, dtype=np.float64).reshape(1, 3),
+                (len(points), 3),
+            )
+        )
+    image = np.full((height, width, 3), background, dtype=np.uint8)
+    if not chunks:
+        return image
+    xyz = np.concatenate(chunks, axis=0)
+    rgb = np.concatenate(colors, axis=0)
+    rel = xyz - eye_v
+    cam_x = rel @ right
+    cam_y = rel @ cam_up
+    depth = rel @ forward
+    visible = depth > near
+    if not np.any(visible):
+        return image
+    cam_x = cam_x[visible]
+    cam_y = cam_y[visible]
+    depth = depth[visible]
+    rgb = rgb[visible]
+    focal = 0.5 * height / math.tan(math.radians(float(fov_deg)) / 2.0)
+    col = cam_x * (focal / depth) + (width * 0.5)
+    row = (height * 0.5) - cam_y * (focal / depth)
+    order = np.argsort(-depth)
+    col = np.rint(col[order]).astype(np.int32)
+    row = np.rint(row[order]).astype(np.int32)
+    rgb = rgb[order]
+    radius = max(0, int(point_px) // 2)
+    for dx in range(-radius, radius + 1):
+        for dy in range(-radius, radius + 1):
+            cc = col + dx
+            rr = row + dy
+            inside = (cc >= 0) & (cc < width) & (rr >= 0) & (rr < height)
+            image[rr[inside], cc[inside]] = np.clip(
+                rgb[inside] * 255.0, 0, 255
+            ).astype(np.uint8)
+    return image
+
+
+def _shared_cameras(
+    points: npt.NDArray[np.float64],
+) -> list[
+    tuple[
+        str,
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+    ]
+]:
+    if len(points) == 0:
+        raise ValueError("cannot frame cameras around an empty cloud")
+    lo = points.min(axis=0)
+    hi = points.max(axis=0)
+    center = 0.5 * (lo + hi)
+    radius = 0.65 * float(np.linalg.norm(hi - lo))
+    radius = max(radius, 0.5)
+    z_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    y_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    cameras = []
+    for name, offset in _VIEWPOINTS:
+        eye = center + offset * radius
+        up = y_up if name == "top" else z_up
+        cameras.append((name, eye, center, up))
+    return cameras
+
+
+def _hstack(
+    images: Sequence[npt.NDArray[np.uint8]], gap: int = 8
+) -> npt.NDArray[np.uint8]:
+    if not images:
+        raise ValueError("no images to stack")
+    height = images[0].shape[0]
+    gap_img = np.full((height, gap, 3), 40, dtype=np.uint8)
+    parts: list[npt.NDArray[np.uint8]] = []
+    for i, image in enumerate(images):
+        if image.shape[0] != height:
+            raise ValueError("hstack images must share height")
+        if i:
+            parts.append(gap_img)
+        parts.append(image)
+    return np.concatenate(parts, axis=1)
+
+
+def _vstack(
+    images: Sequence[npt.NDArray[np.uint8]], gap: int = 8
+) -> npt.NDArray[np.uint8]:
+    if not images:
+        raise ValueError("no images to stack")
+    width = images[0].shape[1]
+    gap_img = np.full((gap, width, 3), 40, dtype=np.uint8)
+    parts: list[npt.NDArray[np.uint8]] = []
+    for i, image in enumerate(images):
+        if image.shape[1] != width:
+            raise ValueError("vstack images must share width")
+        if i:
+            parts.append(gap_img)
+        parts.append(image)
+    return np.concatenate(parts, axis=0)
+
+
+def save_alignment_views(
+    source_before: Any,
+    source_after: Any,
+    target: Any,
+    output_dir: Path,
+    *,
+    max_points: int = DEFAULT_VIS_POINTS,
+    width: int = DEFAULT_VIS_SIZE[0],
+    height: int = DEFAULT_VIS_SIZE[1],
+    seed: int = 0,
+) -> list[Path]:
+    """Write before/after overlays from several viewpoints.
+
+    Orange is source, blue is target.
+    """
+    rng = np.random.default_rng(seed)
+    before = _subsample_xyz(_as_xyz(source_before), max_points, rng)
+    after = _subsample_xyz(_as_xyz(source_after), max_points, rng)
+    tgt = _subsample_xyz(_as_xyz(target), max_points, rng)
+    cameras = _shared_cameras(np.concatenate([before, after, tgt], axis=0))
+    before_row: list[npt.NDArray[np.uint8]] = []
+    after_row: list[npt.NDArray[np.uint8]] = []
+    written: list[Path] = []
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name, eye, look_at, up in cameras:
+        kwargs = dict(
+            eye=eye, look_at=look_at, up=up, width=width, height=height
+        )
+        before_img = rasterize_point_clouds(
+            [(tgt, _TARGET_RGB), (before, _SOURCE_RGB)], **kwargs
+        )
+        after_img = rasterize_point_clouds(
+            [(tgt, _TARGET_RGB), (after, _SOURCE_RGB)], **kwargs
+        )
+        pair = _hstack([before_img, after_img])
+        written.append(_write_png(output_dir / f"{name}.png", pair))
+        before_row.append(before_img)
+        after_row.append(after_img)
+    compare = _vstack([_hstack(before_row), _hstack(after_row)])
+    written.insert(0, _write_png(output_dir / "compare.png", compare))
+    return written
 
 
 def estimate_scale_init(
@@ -306,6 +660,29 @@ def _require_usd_path(path: Path) -> Path:
     return resolved
 
 
+def _usd_prim_vertex_colors(
+    mesh: Any, n_verts: int
+) -> npt.NDArray[np.float64]:
+    """UsdGeom displayColor, or a neutral gray if the prim has none."""
+    colors = np.full((n_verts, 3), 0.72, dtype=np.float64)
+    getter = getattr(mesh, "GetDisplayColorAttr", None)
+    if getter is None:
+        return colors
+    raw = getter().Get()
+    if not raw:
+        return colors
+    arr = np.array(
+        [(float(c[0]), float(c[1]), float(c[2])) for c in raw],
+        dtype=np.float64,
+    )
+    if arr.shape == (1, 3):
+        colors[:] = arr[0]
+        return colors
+    if len(arr) == n_verts:
+        return arr
+    return colors
+
+
 def usd_to_triangle_mesh(path: Path | str) -> o3d.geometry.TriangleMesh:
     """Load every ``UsdGeom.Mesh`` in *path* into one world-space Open3D mesh.
 
@@ -327,6 +704,7 @@ def usd_to_triangle_mesh(path: Path | str) -> o3d.geometry.TriangleMesh:
 
     vertices: list[npt.NDArray[np.float64]] = []
     triangles: list[tuple[int, int, int]] = []
+    vert_colors: list[npt.NDArray[np.float64]] = []
     vertex_offset = 0
 
     for prim in Usd.PrimRange(stage.GetPseudoRoot()):
@@ -348,6 +726,7 @@ def usd_to_triangle_mesh(path: Path | str) -> o3d.geometry.TriangleMesh:
         indices = mesh.GetFaceVertexIndicesAttr().Get() or []
         faces = _triangulate_faces(counts, indices)
         vertices.append(world)
+        vert_colors.append(_usd_prim_vertex_colors(mesh, world.shape[0]))
         triangles.extend(
             (
                 a + vertex_offset,
@@ -367,6 +746,7 @@ def usd_to_triangle_mesh(path: Path | str) -> o3d.geometry.TriangleMesh:
 
     mesh_out = o3d.geometry.TriangleMesh()
     mesh_out.vertices = o3d.utility.Vector3dVector(points)
+    mesh_out.vertex_colors = o3d.utility.Vector3dVector(np.vstack(vert_colors))
     if triangles:
         mesh_out.triangles = o3d.utility.Vector3iVector(
             np.asarray(triangles, dtype=np.int32)
@@ -374,11 +754,16 @@ def usd_to_triangle_mesh(path: Path | str) -> o3d.geometry.TriangleMesh:
     return mesh_out
 
 
-def glb_to_triangle_mesh(path: Path | str) -> o3d.geometry.TriangleMesh:
+def glb_to_triangle_mesh(
+    path: Path | str,
+    *,
+    y_up_to_z_up: bool = True,
+) -> o3d.geometry.TriangleMesh:
     """Load a glTF/GLB file as one Open3D triangle mesh.
 
-    glTF is Y-up; vertices are rotated Rx(+90°) into Isaac Z-up so a GLB
-    source lines up with a Z-up USD target.
+    glTF is Y-up. By default vertices are rotated Rx(+90°) into Isaac
+    Z-up so a GLB source lines up with a Z-up USD target. Pass
+    ``y_up_to_z_up=False`` to keep the original native cloud.
     """
     o3d = _require_open3d()
     glb_path = _require_geometry_path(Path(path))
@@ -406,19 +791,24 @@ def glb_to_triangle_mesh(path: Path | str) -> o3d.geometry.TriangleMesh:
     combined = meshes[0]
     for extra in meshes[1:]:
         combined += extra
-    points = _transform_points(
-        np.asarray(combined.vertices, dtype=np.float64),
-        Y_UP_TO_Z_UP,
-    )
-    combined.vertices = o3d.utility.Vector3dVector(points)
+    if y_up_to_z_up:
+        points = _transform_points(
+            np.asarray(combined.vertices, dtype=np.float64),
+            Y_UP_TO_Z_UP,
+        )
+        combined.vertices = o3d.utility.Vector3dVector(points)
     return combined
 
 
-def load_triangle_mesh(path: Path | str) -> o3d.geometry.TriangleMesh:
+def load_triangle_mesh(
+    path: Path | str,
+    *,
+    y_up_to_z_up: bool = True,
+) -> o3d.geometry.TriangleMesh:
     """Dispatch USD/USDZ vs GLB/glTF into a world-space Open3D mesh."""
     resolved = _require_geometry_path(Path(path))
     if resolved.suffix.lower() in GLB_SUFFIXES:
-        return glb_to_triangle_mesh(resolved)
+        return glb_to_triangle_mesh(resolved, y_up_to_z_up=y_up_to_z_up)
     return usd_to_triangle_mesh(resolved)
 
 
@@ -454,9 +844,21 @@ def usd_to_point_cloud(
 def load_as_point_cloud(
     path: Path | str,
     n_points: int = DEFAULT_N_POINTS,
+    *,
+    y_up_to_z_up: bool = True,
 ) -> o3d.geometry.PointCloud:
     """USD or GLB path → sampled Open3D point cloud."""
-    return sample_mesh_to_point_cloud(load_triangle_mesh(path), n_points)
+    return sample_mesh_to_point_cloud(
+        load_triangle_mesh(path, y_up_to_z_up=y_up_to_z_up), n_points
+    )
+
+
+def load_as_point_cloud_native(
+    path: Path | str,
+    n_points: int = DEFAULT_N_POINTS,
+) -> o3d.geometry.PointCloud:
+    """Sample the original native cloud (no Y-up → Z-up bake)."""
+    return load_as_point_cloud(path, n_points, y_up_to_z_up=False)
 
 
 def multiscale_similarity_icp(
@@ -599,20 +1001,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--target",
         type=Path,
         default=DEFAULT_TARGET,
-        help="ICP fixed cloud / CAD room "
-        "(default: assets/robot_room.usd).",
+        help="ICP fixed cloud / CAD room (default: assets/robot_room.usd).",
     )
     parser.add_argument(
         "--public-ip",
         default=None,
-        help="PUBLIC_IP in the printed command "
-        "(default: $PUBLIC_IP or ???).",
+        help="PUBLIC_IP in the printed command (default: $PUBLIC_IP or ???).",
     )
     parser.add_argument(
         "--container-repo",
         default=DEFAULT_CONTAINER_REPO,
-        help="CONTAINER_REPO mount "
-        f"(default: {DEFAULT_CONTAINER_REPO}).",
+        help=f"CONTAINER_REPO mount (default: {DEFAULT_CONTAINER_REPO}).",
     )
     parser.add_argument(
         "--voxel-sizes",
@@ -655,6 +1054,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=50,
         help="ICP iterations at each pyramid level (default: 50).",
     )
+    parser.add_argument(
+        "--vis-dir",
+        type=Path,
+        default=None,
+        help="Directory for before/after viewpoint PNGs (default: "
+        "outputs/align_automatic/<mesh-stem>).",
+    )
+    parser.add_argument(
+        "--vis-points",
+        type=int,
+        default=DEFAULT_VIS_POINTS,
+        help="Max points per cloud in the viewpoint renders "
+        f"(default: {DEFAULT_VIS_POINTS}).",
+    )
+    parser.add_argument(
+        "--no-vis",
+        action="store_true",
+        help="Skip writing before/after alignment PNGs.",
+    )
     return parser
 
 
@@ -665,9 +1083,7 @@ def main(argv: list[str] | None = None) -> int:
     source_path = _require_geometry_path(args.source or args.mesh)
     target_path = _require_geometry_path(args.target)
     public_ip = (
-        args.public_ip
-        or os.environ.get("PUBLIC_IP", "").strip()
-        or "???"
+        args.public_ip or os.environ.get("PUBLIC_IP", "").strip() or "???"
     )
 
     print(f"Loading source {source_path}", flush=True)
@@ -702,14 +1118,41 @@ def main(argv: list[str] | None = None) -> int:
         init=init,
         max_iterations=args.max_iterations,
     )
-    scale = result["scale"]
-    rotation = result["rotation"]
-    translation = result["translation"]
+    scale, rotation, translation, command = scene_similarity_from_alignment(
+        result["transformation"], source_path
+    )
     np.set_printoptions(precision=6, suppress=True)
-    print("\nFull homogeneous matrix:\n", result["transformation"])
+    print("\nAligned-frame homogeneous matrix:\n", result["transformation"])
+    print("\nNative-frame command matrix:\n", command)
     print(f"\nScale factor: {scale:.6f}")
     print("Rotation:\n", rotation)
     print("Translation:", translation)
+    if not args.no_vis:
+        native_source = load_as_point_cloud_native(
+            source_path, n_points=args.n_points
+        )
+        after = copy.deepcopy(native_source)
+        after.transform(command)
+        vis_dir = args.vis_dir
+        if vis_dir is None:
+            vis_dir = (
+                _REPO_ROOT / "outputs" / "align_automatic" / mesh_path.stem
+            )
+        paths = save_alignment_views(
+            native_source,
+            after,
+            target,
+            vis_dir,
+            max_points=args.vis_points,
+        )
+        print(f"\nAlignment views ({len(paths)} PNGs): {vis_dir}")
+        print(
+            "  compare.png  rows=before/after ICP, cols=iso, front, side, top"
+        )
+        print(
+            "  iso/front/side/top.png  left=before, right=after; "
+            "orange=source mesh, blue=target room"
+        )
     print("\nscene_room.py flags:")
     print(format_scene_room_flags(scale, rotation, translation))
     print("\nteleop command:")
