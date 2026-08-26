@@ -45,6 +45,7 @@ WITH_ARM_KEYBOARD_TELEOP=false
 WITH_BROWSER=true
 WITH_REPUBLISHER=true
 HEADLESS=false
+LIVESTREAM=false
 EXTRA_BRIDGE_ARGS=()
 
 usage() {
@@ -68,16 +69,19 @@ Options:
   --with-gello-teleop        Start the GELLO->bridge teleop adapter
   --with-gello-pedal-teleop  Alias of --with-gello-teleop (tested pedal+GELLO path)
   --with-arm-keyboard-teleop Drive both arm end effectors from the Isaac Sim
-                             window keyboard via dual RMPflow. LEFT arm:
-                             W/S A/D Q/E move, Z/X T/G C/V rotate, F gripper.
-                             RIGHT arm: O/L K/; I/P move, N/M U/J ,/. rotate,
-                             ' gripper. R resets both targets. While active,
-                             ROS arm/gripper commands (browser/GELLO) are NOT
-                             applied. (Equivalent to passing
-                             '-- --arm-keyboard-teleop'.)
+                             window keyboard via dual RMPflow (also works
+                             over WebRTC --livestream; focus the streaming
+                             client). LEFT arm: W/S A/D Q/E move, Z/X T/G
+                             C/V rotate, F gripper. RIGHT arm: O/L K/; I/P
+                             move, N/M U/J ,/. rotate, ' gripper. R resets
+                             both targets. While active, ROS arm/gripper
+                             commands (browser/GELLO) are NOT applied.
+                             (Equivalent to passing '-- --arm-keyboard-teleop'.)
   --no-browser               Do not start browser_controller
   --no-republisher           Do not start ros_republisher
   --headless                 Run Isaac Sim without a visible Kit window
+  --livestream               WebRTC livestream (implies headless); set PUBLIC_IP
+                             for remote EC2 clients (TCP 49100 + UDP 47998)
   --                         Pass remaining args to the scene script (scene_room.py | scene_barebone.py)
 
 The teleop input *device* publishers (keyboard / GELLO / pedal) come from the
@@ -132,6 +136,11 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --headless)
+      HEADLESS=true
+      shift
+      ;;
+    --livestream)
+      LIVESTREAM=true
       HEADLESS=true
       shift
       ;;
@@ -286,6 +295,10 @@ if ${HEADLESS}; then
   BRIDGE_ARGS+=("--headless")
 fi
 
+if ${LIVESTREAM}; then
+  BRIDGE_ARGS+=("--livestream")
+fi
+
 BRIDGE_ARGS+=("${EXTRA_BRIDGE_ARGS[@]}")
 
 echo "Launching Isaac Sim 5.1.0 teleop bridge..."
@@ -297,6 +310,12 @@ if [[ -n "${TERM:-}" ]]; then
   DOCKER_EXEC_ENV+=("-e" "TERM=${TERM}")
 fi
 DOCKER_EXEC_ENV+=("-e" "QT_X11_NO_MITSHM=1")
+# WebRTC livestream: Kit reads PUBLIC_IP for the ICE candidate address.
+# Without it the container advertises 127.0.0.1 and remote clients never
+# establish the media stream.
+if [[ -n "${PUBLIC_IP:-}" ]]; then
+  DOCKER_EXEC_ENV+=("-e" "PUBLIC_IP=${PUBLIC_IP}")
+fi
 # Use the ROS 2 jazzy libraries bundled with Isaac Sim's ros2 bridge extension
 # (the container has no system ROS 2). LD_LIBRARY_PATH must be set before the
 # process starts or rclpy node creation fails.

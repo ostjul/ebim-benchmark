@@ -85,15 +85,49 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 args_cli = _build_arg_parser().parse_args()
 resolve_recording_flags(args_cli)
 
+# WebRTC livestream (same idea as Isaac Lab --livestream 1 / PUBLIC_IP).
+# Match /isaac-sim/standalone_examples/api/isaacsim.simulation_app/livestream.py
+# — bare headless+webrtc often connects but shows a black viewport.
+if args_cli.livestream:
+    import os
+    import sys
+
+    args_cli.headless = True
+    _public_ip = os.environ.get("PUBLIC_IP", "").strip()
+    sys.argv.append("--/app/livestream/port=49100")
+    # Pin the WebRTC media/host UDP port so it is firewallable. Without this,
+    # streamsdk grabs a random ephemeral UDP port each run, which can never
+    # match a fixed Security Group rule -> signaling connects but media is
+    # dropped and the client shows a gray/black viewport. 47998 matches the
+    # UDP rule documented in setup.md.
+    _media_port = os.environ.get("LIVESTREAM_MEDIA_PORT", "47998").strip()
+    sys.argv.append(f"--/app/livestream/fixedHostPort={_media_port}")
+    sys.argv.append(f"--/app/livestream/minHostPort={_media_port}")
+    sys.argv.append(f"--/app/livestream/maxHostPort={_media_port}")
+    if _public_ip:
+        sys.argv.append(f"--/app/livestream/publicEndpointAddress={_public_ip}")
+
 from isaacsim import SimulationApp  # noqa: E402
 
-simulation_app = SimulationApp(
-    {"headless": args_cli.headless, "width": 1280, "height": 720}
-)
+_app_config: dict = {"headless": args_cli.headless, "width": 1280, "height": 720}
+if args_cli.livestream:
+    _app_config.update(
+        {
+            "window_width": 1920,
+            "window_height": 1080,
+            "hide_ui": False,  # required — otherwise WebRTC gets a black frame
+            "renderer": "RaytracedLighting",
+            "display_options": 3286,
+        }
+    )
+simulation_app = SimulationApp(launch_config=_app_config)
 
 from isaacsim.core.utils.extensions import enable_extension  # noqa: E402
 
 enable_extension("isaacsim.ros2.bridge")
+if args_cli.livestream:
+    enable_extension("omni.kit.livestream.webrtc")
+    simulation_app.set_setting("/app/window/drawMouse", True)
 simulation_app.update()
 
 import isaacsim_fr3duo_teleop_bridge_core as core  # noqa: E402
@@ -152,11 +186,14 @@ def main():
 
     world.scene.add_default_ground_plane()
     core._add_dome_light(stage)
-    if not args_cli.headless:
-        set_camera_view(
-            eye=list(args_cli.camera_position),
-            target=list(args_cli.camera_target),
-        )
+    # Always aim the Kit perspective camera: under --livestream Kit is
+    # headless but WebRTC still streams /OmniverseKit_Persp. Skipping this
+    # leaves the default eye looking at empty space, so the client appears
+    # to have "no scene/assets".
+    set_camera_view(
+        eye=list(args_cli.camera_position),
+        target=list(args_cli.camera_target),
+    )
 
     articulation_root_path = core._find_articulation_root_path(
         args_cli.robot_prim_path
@@ -198,11 +235,12 @@ def main():
         spine_keyboard_controller,
         arm_keyboard_teleop,
         args_cli,
+        # WebRTC needs viewport frames; headless otherwise skips render.
         # Camera OmniGraphs only publish on rendered frames; keep rendering
         # in headless sessions when any cameras are enabled.
-        force_render=(
-            args_cli.enable_robot_cameras or args_cli.enable_scene_cameras
-        ),
+        force_render=args_cli.enable_robot_cameras
+            or args_cli.enable_scene_cameras
+            or bool(args_cli.livestream),
         tick_callbacks=tick_callbacks,
     )
 

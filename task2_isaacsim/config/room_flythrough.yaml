@@ -1,0 +1,48 @@
+# Copyright (c) 2026 The EBiM Benchmark Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# 120 poses on an ellipse around TASK2_TABLE_POSITION XY (5 m X diameter,
+# 1 m Y diameter) at eye height with a ±10 cm height wave. Camera looks
+# along the 3D path tangent (true slope). Then four 1 m circles at the
+# same XY center: inward at 1.00 m and 1.50 m, outward at 1.25 m and
+# 1.75 m. One equirectangular still at the table XY / 1.5 m.
+version: 1
+camera:
+  prim_path: /World/Scene/flythrough_camera
+  width: 1280
+  height: 720
+  focal_length: 20.0
+  focus_distance: 400.0
+  projection: perspective
+orbit:
+  center_xy: [2.05, 1.95]
+  diameter_x_m: 5.0
+  diameter_y_m: 1.0
+  height_m: 1.5
+  n_poses: 120
+  start_deg: 0.0
+  wave_amp_m: 0.10
+  wave_cycles: 4.0
+circles:
+  radius_m: 1.0
+  n_poses: 120
+  start_deg: 0.0
+  paths:
+    - look: inward
+      height_m: 1.00
+    - look: outward
+      height_m: 1.25
+    - look: inward
+      height_m: 1.50
+    - look: outward
+      height_m: 1.75
+video_fps: 10.0
+# Equirectangular still over TASK2_TABLE_POSITION XY at eye height.
+# Rx=90 puts the horizon on the equator (camera +Y → world +Z).
+panorama:
+  prim_path: /World/Scene/pano_camera
+  translation: [2.05, 1.95, 1.5]
+  rotation_xyz_deg: [90.0, 0.0, 0.0]
+  width: 2048
+  height: 1024
+  projection: fisheyeSpherical

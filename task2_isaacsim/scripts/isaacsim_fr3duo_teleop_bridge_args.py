@@ -90,8 +90,10 @@ def add_common_bridge_args(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Drive both arm end effectors with the Kit-window keyboard "
-        "through dual RMPflow. While active, ROS arm and gripper "
-        "commands are NOT applied (joint states are still published).",
+        "through dual RMPflow (also works over WebRTC --livestream; "
+        "disabled for pure --headless). While active, ROS arm and "
+        "gripper commands are NOT applied (joint states are still "
+        "published).",
     )
     parser.add_argument(
         "--arm-teleop-linear-speed",
@@ -149,6 +151,13 @@ def add_common_bridge_args(parser: argparse.ArgumentParser) -> None:
         "and their script node crashes plain Isaac Sim.",
     )
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--livestream",
+        action="store_true",
+        help="Enable Isaac Sim WebRTC livestream (implies headless Kit). "
+        "Advertise PUBLIC_IP for remote EC2 clients "
+        "(TCP 49100 + UDP 47998).",
+    )
     _add_recording_args(parser)
 
 

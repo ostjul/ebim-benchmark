@@ -9,6 +9,10 @@ task2 (robot room + mobile FR3 + Task 2 objects on the table + the
 build_stage(), and drives it with the same ROS teleop bridge as the barebone
 scene_barebone.py (shared isaacsim_fr3duo_teleop_bridge_core module).
 
+--room-usd defaults to robot_room.usd. A NuRec .usdz instead composes that
+volume with --mesh. --xyz-deg / --xyz / --scale always move the loaded room
+(robot stays in world).
+
 Runs inside the plain Isaac Sim 5.1.0 container with /isaac-sim/python.sh; see
 scene_barebone.py for the environment requirements and
 task2_isaacsim/README.md for the full workflow.
@@ -19,6 +23,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCENES_DIR = _REPO_ROOT / "scripts" / "scenes"
@@ -39,6 +44,32 @@ DEFAULT_ROBOT_USD = (
     / "Robotiq_2f_85_with_d405_mobile_fr3_duo_v0_2.usd"
 )
 
+ROBOT_PRIM_PATH = "/World/Robot"
+TASK_OBJECTS_ROOT = "/World/Scene/task_objects"
+TASK2_VIEW_EYE = (1.0, 2.5, 1.35)
+ENV_ROOT_PATH = "/World/Environment/Room"
+ENV_VOLUME_PATH = f"{ENV_ROOT_PATH}/Volume"
+ENV_MESH_PATH = f"{ENV_ROOT_PATH}/Mesh"
+ROOM_USD_PRIM_PATH = "/World/Environment/RobotRoom"
+TABLE_PATH = "/World/Scene/Table"
+# GLB node is already Rx(+90°); cancel it so mesh and volume share --xyz-deg.
+MESH_RX_OFFSET_DEG = -90.0
+
+
+def _is_nurec_asset(path: Path) -> bool:
+    return path.suffix.lower() in {".usdz", ".nurec"}
+
+
+def _as_scale(values: Any) -> tuple[float, float, float]:
+    if not values:
+        return (1.0, 1.0, 1.0)
+    vals = [abs(float(v)) for v in values]
+    if len(vals) == 1:
+        return (vals[0], vals[0], vals[0])
+    if len(vals) == 3:
+        return (vals[0], vals[1], vals[2])
+    raise ValueError("--scale expects 1 or 3 floats")
+
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -46,13 +77,56 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--room-usd",
         type=Path,
         default=room_scene.asset_path("robot_room.usd"),
-        help="Room USD to reference.",
+        help="Room USD to reference (default: robot_room.usd). A NuRec "
+        ".usdz is composed with --mesh instead of the original room.",
     )
     parser.add_argument(
         "--robot-usd",
         type=Path,
         default=DEFAULT_ROBOT_USD,
         help="Robot USD to reference.",
+    )
+    parser.add_argument(
+        "--mesh",
+        type=Path,
+        default=None,
+        help="Collider mesh (GLB/USD) for a NuRec .usdz room. Required "
+        "when --room-usd is a .usdz; ignored otherwise.",
+    )
+    parser.add_argument(
+        "--xyz-deg",
+        type=float,
+        nargs=3,
+        default=(0.0, 0.0, 0.0),
+        metavar=("RX", "RY", "RZ"),
+        help="Euler XYZ rotation (degrees) of the loaded room "
+        "(NuRec volume+mesh, or robot_room.usd). Robot stays in world.",
+    )
+    parser.add_argument(
+        "--xyz",
+        type=float,
+        nargs=3,
+        default=(0.0, 0.0, 0.0),
+        metavar=("X", "Y", "Z"),
+        help="Translate (metres) of the loaded room "
+        "(NuRec volume+mesh, or robot_room.usd). Robot stays in world.",
+    )
+    parser.add_argument(
+        "--scale",
+        type=float,
+        nargs="+",
+        default=[1.0],
+        metavar="S",
+        help="Scale of the loaded room (NuRec volume+mesh, or "
+        "robot_room.usd): one uniform value or X Y Z, each "
+        "clamped to [0, +inf). Robot stays in world.",
+    )
+    parser.add_argument(
+        "--align",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Listen for align_nudger.py (NuRec mode only). "
+        "Off unless you pass --align.",
     )
     parser.add_argument(
         "--task",
@@ -98,17 +172,63 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 args_cli = _build_arg_parser().parse_args()
 resolve_recording_flags(args_cli)
 
+_nurec_mode = _is_nurec_asset(Path(args_cli.room_usd).expanduser())
+if _nurec_mode and args_cli.mesh is None:
+    raise SystemExit("NuRec --room-usd requires --mesh PATH (GLB/USD collider).")
+
+# WebRTC livestream (same idea as Isaac Lab --livestream 1 / PUBLIC_IP).
+# Match /isaac-sim/standalone_examples/api/isaacsim.simulation_app/livestream.py
+# — bare headless+webrtc often connects but shows a black viewport.
+if args_cli.livestream:
+    import os
+
+    args_cli.headless = True
+    _public_ip = os.environ.get("PUBLIC_IP", "").strip()
+    sys.argv.append("--/app/livestream/port=49100")
+    # Pin the WebRTC media/host UDP port so it is firewallable. Without this,
+    # streamsdk grabs a random ephemeral UDP port each run, which can never
+    # match a fixed Security Group rule -> signaling connects but media is
+    # dropped and the client shows a gray/black viewport. 47998 matches the
+    # UDP rule documented in setup.md.
+    _media_port = os.environ.get("LIVESTREAM_MEDIA_PORT", "47998").strip()
+    sys.argv.append(f"--/app/livestream/fixedHostPort={_media_port}")
+    sys.argv.append(f"--/app/livestream/minHostPort={_media_port}")
+    sys.argv.append(f"--/app/livestream/maxHostPort={_media_port}")
+    if _public_ip:
+        sys.argv.append(f"--/app/livestream/publicEndpointAddress={_public_ip}")
+
+# Isaac Sim 5.1 NuRec volumes need UJITSO before Kit starts.
+if _nurec_mode:
+    sys.argv.append("--/UJITSO/geometry=true")
+    sys.argv.append("--/renderer/multiGpu/enabled=false")
+    sys.argv.append("--/rtx/rtpt/gaussian/skipTonemapping/enabled=false")
+
 from isaacsim import SimulationApp  # noqa: E402
 
-simulation_app = SimulationApp(
-    {"headless": args_cli.headless, "width": 1280, "height": 720}
-)
+_app_config: dict = {"headless": args_cli.headless, "width": 1280, "height": 720}
+if args_cli.livestream:
+    _app_config.update(
+        {
+            "window_width": 1920,
+            "window_height": 1080,
+            "hide_ui": False,  # required — otherwise WebRTC gets a black frame
+            "renderer": "RaytracedLighting",
+            "display_options": 3286,
+        }
+    )
+if _nurec_mode:
+    _app_config["multi_gpu"] = False
+    _app_config["renderer"] = "RaytracedLighting"
+simulation_app = SimulationApp(launch_config=_app_config)
 
 from isaacsim.core.utils.extensions import enable_extension  # noqa: E402
 
 # Must be enabled before build_stage(): the task2 eval camera OmniGraph uses
 # isaacsim.ros2.bridge node types.
 enable_extension("isaacsim.ros2.bridge")
+if args_cli.livestream:
+    enable_extension("omni.kit.livestream.webrtc")
+    simulation_app.set_setting("/app/window/drawMouse", True)
 simulation_app.update()
 
 import isaacsim_fr3duo_teleop_bridge_core as core  # noqa: E402
@@ -119,9 +239,135 @@ from isaacsim.core.api import World  # noqa: E402
 from isaacsim.core.prims import SingleArticulation  # noqa: E402
 from isaacsim.core.utils.viewports import set_camera_view  # noqa: E402
 
-ROBOT_PRIM_PATH = "/World/Robot"
-TASK_OBJECTS_ROOT = "/World/Scene/task_objects"
-TASK2_VIEW_EYE = (1.0, 2.5, 1.35)
+
+def _author_mesh_collision(stage: Any, root_path: str) -> int:
+    from pxr import Usd, UsdGeom, UsdPhysics
+
+    root = stage.GetPrimAtPath(root_path)
+    if not root or not root.IsValid():
+        return 0
+    authored = 0
+    for prim in Usd.PrimRange(root):
+        if not prim.IsA(UsdGeom.Mesh):
+            continue
+        UsdPhysics.CollisionAPI.Apply(prim)
+        UsdPhysics.MeshCollisionAPI.Apply(prim).CreateApproximationAttr(
+            "meshSimplification"
+        )
+        authored += 1
+    return authored
+
+
+def _apply_env_xform(
+    prim: Any,
+    xyz: tuple[float, float, float],
+    xyz_deg: tuple[float, float, float],
+    scale: tuple[float, float, float],
+) -> None:
+    """Translate, Euler-XYZ rotate, then scale a room root. Robot is unchanged."""
+    from pxr import Gf, UsdGeom
+
+    room_scene.set_xform(prim, xyz, room_scene.euler_xyz_to_quat(xyz_deg))
+    UsdGeom.Xformable(prim).AddScaleOp(UsdGeom.XformOp.PrecisionDouble).Set(
+        Gf.Vec3d(*scale)
+    )
+    print("Joint xyz:", xyz, "Rxyz deg:", xyz_deg, "scale:", scale)
+
+
+def compose_nurec_environment(
+    stage: Any,
+    *,
+    volume_path: Path,
+    mesh_path: Path,
+    xyz: tuple[float, float, float],
+    xyz_deg: tuple[float, float, float],
+    scale: tuple[float, float, float],
+) -> None:
+    """Volume + mesh under one joint xform; mesh only adds the GLB Rx offset."""
+    from pxr import UsdGeom
+
+    UsdGeom.Scope.Define(stage, "/World/Environment")
+    root = UsdGeom.Xform.Define(stage, ENV_ROOT_PATH).GetPrim()
+    _apply_env_xform(root, xyz, xyz_deg, scale)
+
+    volume = UsdGeom.Xform.Define(stage, ENV_VOLUME_PATH).GetPrim()
+    volume.GetReferences().AddReference(str(volume_path.resolve()))
+
+    mesh = UsdGeom.Xform.Define(stage, ENV_MESH_PATH).GetPrim()
+    room_scene.set_xform(
+        mesh,
+        (0.0, 0.0, 0.0),
+        room_scene.euler_xyz_to_quat((MESH_RX_OFFSET_DEG, 0.0, 0.0)),
+    )
+    mesh_asset = UsdGeom.Xform.Define(stage, f"{ENV_MESH_PATH}/Asset").GetPrim()
+    mesh_asset.GetReferences().AddReference(str(mesh_path.resolve()))
+    n_col = _author_mesh_collision(stage, ENV_MESH_PATH)
+    UsdGeom.Imageable(mesh).MakeInvisible()
+    print(f"Mesh collision on {n_col} Mesh prim(s) (hidden; volume stays visible)")
+    print("Volume:", volume_path)
+    print("Mesh:", mesh_path)
+
+
+def build_nurec_stage(
+    app: Any,
+    *,
+    volume_path: Path,
+    mesh_path: Path,
+    robot_path: Path,
+    robot_position: tuple[float, float, float],
+    robot_rotation: tuple[float, float, float, float],
+    task: str,
+    xyz: tuple[float, float, float],
+    xyz_deg: tuple[float, float, float],
+    scale: tuple[float, float, float],
+) -> Any:
+    from pxr import UsdGeom
+
+    context = omni.usd.get_context()
+    context.new_stage()
+    for _ in range(10):
+        app.update()
+    stage = context.get_stage()
+    if stage is None:
+        raise RuntimeError("Could not create an Isaac Sim stage.")
+
+    stage.SetFramesPerSecond(60.0)
+    stage.SetTimeCodesPerSecond(60.0)
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    world = UsdGeom.Xform.Define(stage, "/World")
+    stage.SetDefaultPrim(world.GetPrim())
+
+    compose_nurec_environment(
+        stage,
+        volume_path=volume_path,
+        mesh_path=mesh_path,
+        xyz=xyz,
+        xyz_deg=xyz_deg,
+        scale=scale,
+    )
+    room_scene.reference_usd(
+        stage, ROBOT_PRIM_PATH, robot_path, robot_position, robot_rotation
+    )
+    if task == "task2":
+        table_usd = room_scene.asset_path("table_edit.usd")
+        if not table_usd.is_file():
+            raise FileNotFoundError(f"Task 2 table USD missing: {table_usd}")
+        table_xy = room_scene.TASK2_TABLE_POSITION
+        room_scene.reference_usd(
+            stage,
+            TABLE_PATH,
+            table_usd,
+            (table_xy[0], table_xy[1], 0.0),
+            (1.0, 0.0, 0.0, 0.0),
+        )
+        _author_mesh_collision(stage, TABLE_PATH)
+        room_scene.load_deformable_assets(stage)
+        room_scene.setup_deformable_camera(stage)
+
+    for _ in range(10):
+        app.update()
+    return stage
 
 
 def main():
@@ -133,6 +379,13 @@ def main():
     if not robot_path.is_file():
         raise FileNotFoundError(f"Robot USD not found: {robot_path}")
 
+    nurec_mode = _is_nurec_asset(room_path)
+    mesh_path = (
+        Path(args_cli.mesh).expanduser() if args_cli.mesh is not None else None
+    )
+    if nurec_mode and (mesh_path is None or not mesh_path.is_file()):
+        raise FileNotFoundError(f"NuRec room requires --mesh (missing: {mesh_path})")
+
     groups = core._load_joint_groups(
         franka_root,
         args_cli.embodiment,
@@ -141,20 +394,45 @@ def main():
 
     robot_position = room_scene.resolve_robot_position(args_cli)
     robot_yaw = room_scene.resolve_robot_yaw(args_cli)
+    env_xyz = tuple(args_cli.xyz)
+    env_xyz_deg = tuple(args_cli.xyz_deg)
+    env_scale = _as_scale(args_cli.scale)
 
     app = omni.kit.app.get_app()
-    room_scene.build_stage(
-        app,
-        room_path=room_path,
-        robot_path=robot_path,
-        task=args_cli.task,
-        robot_position=robot_position,
-        robot_rotation=room_scene.yaw_to_quat(robot_yaw),
-        robot_yaw=robot_yaw,
-        head_placement=args_cli.head_placement,
-    )
-    if args_cli.task == "task2" and not args_cli.headless:
+    if nurec_mode:
+        build_nurec_stage(
+            app,
+            volume_path=room_path,
+            mesh_path=mesh_path,
+            robot_path=robot_path,
+            robot_position=robot_position,
+            robot_rotation=room_scene.yaw_to_quat(robot_yaw),
+            task=args_cli.task,
+            xyz=env_xyz,
+            xyz_deg=env_xyz_deg,
+            scale=env_scale,
+        )
+    else:
+        room_scene.build_stage(
+            app,
+            room_path=room_path,
+            robot_path=robot_path,
+            task=args_cli.task,
+            robot_position=robot_position,
+            robot_rotation=room_scene.yaw_to_quat(robot_yaw),
+            robot_yaw=robot_yaw,
+            head_placement=args_cli.head_placement,
+        )
+        room_prim = omni.usd.get_context().get_stage().GetPrimAtPath(
+            ROOM_USD_PRIM_PATH
+        )
+        if not room_prim or not room_prim.IsValid():
+            raise RuntimeError(f"Missing room prim {ROOM_USD_PRIM_PATH}")
+        _apply_env_xform(room_prim, env_xyz, env_xyz_deg, env_scale)
+    if args_cli.task == "task2":
         # Override build_stage's room overview with a view of the task2 table.
+        # Also required for --livestream (headless Kit, WebRTC streams this
+        # perspective camera).
         set_camera_view(
             eye=list(TASK2_VIEW_EYE),
             target=list(room_scene.TASK2_TABLE_POSITION),
@@ -183,6 +461,8 @@ def main():
     # GPU dynamics is required by the thermal pad (PhysxDeformableBodyAPI).
     physics_context.enable_gpu_dynamics(True)
     physics_context.set_broadphase_type("GPU")
+    if nurec_mode:
+        world.scene.add_default_ground_plane()
 
     core.prepare_robot_prim(ROBOT_PRIM_PATH, args_cli)
 
@@ -212,6 +492,26 @@ def main():
         spine_controller=spine_keyboard_controller,
         arm_teleop=arm_keyboard_teleop,
     )
+
+    if nurec_mode and args_cli.align:
+        from align_nudger import AlignController, default_prims  # noqa: PLC0415
+
+        tick_callbacks.append(
+            AlignController(
+                prims={
+                    "root": stage.GetPrimAtPath(ENV_ROOT_PATH),
+                    "mesh": stage.GetPrimAtPath(ENV_MESH_PATH),
+                },
+                set_xform=room_scene.set_xform,
+                euler_to_quat=room_scene.euler_xyz_to_quat,
+                initial=default_prims(
+                    xyz=env_xyz,
+                    xyz_deg=env_xyz_deg,
+                    scale=env_scale,
+                ),
+                mesh_visible=False,
+            )
+        )
 
     core.run_teleop_loop(
         simulation_app,
